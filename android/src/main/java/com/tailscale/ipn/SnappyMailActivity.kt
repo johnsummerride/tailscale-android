@@ -18,10 +18,13 @@ import android.widget.Button
 import android.widget.FrameLayout
 import android.widget.LinearLayout
 import android.widget.TextView
-import androidx.lifecycle.lifecycleScope
 import com.tailscale.ipn.ui.model.Ipn
 import com.tailscale.ipn.ui.notifier.Notifier
 import com.tailscale.ipn.util.TSLog
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
 import kotlinx.coroutines.launch
 
 // SnappyMailActivity shows the self-hosted SnappyMail webmail that lives on the tailnet.
@@ -42,6 +45,7 @@ class SnappyMailActivity : Activity() {
   private lateinit var actionButton: Button
   private var pageRequested = false
   private var vpnStartRequested = false
+  private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
 
   override fun onCreate(savedInstanceState: Bundle?) {
     super.onCreate(savedInstanceState)
@@ -100,7 +104,7 @@ class SnappyMailActivity : Activity() {
   }
 
   private fun observeVpnState() {
-    lifecycleScope.launch {
+    scope.launch {
       Notifier.state.collect { state -> updateForState(state) }
     }
   }
@@ -195,6 +199,7 @@ class SnappyMailActivity : Activity() {
   }
 
   override fun onDestroy() {
+    scope.cancel()
     webView.destroy()
     super.onDestroy()
   }
