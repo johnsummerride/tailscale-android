@@ -123,6 +123,14 @@ class SnappyMailActivity : Activity() {
     webView =
         WebView(this).apply {
           setBackgroundColor(Color.WHITE)
+          // MIUI's GPU/compositor path hangs for this WebView: the DOM, CSS and JS are all fine
+          // (getComputedStyle and innerText return the rendered login page) but nothing reaches
+          // the screen, and even Page.captureScreenshot never completes. Forcing a software
+          // layer bypasses the HWUI render thread entirely, so the page is drawn on the main
+          // thread and composition cannot stall. The manifest also sets
+          // android:hardwareAccelerated="false" on this activity; both are needed because the
+          // window flag alone does not keep the WebView renderer off the GPU path.
+          setLayerType(View.LAYER_TYPE_SOFTWARE, null)
           visibility = View.INVISIBLE
           settings.javaScriptEnabled = true
           settings.domStorageEnabled = true
