@@ -90,6 +90,10 @@ class SnappyMailActivity : Activity() {
   }
 
   private lateinit var webView: WebView
+  // statusPanel is the full-screen white container that holds statusView and actionButton. It is
+  // added on top of the WebView, so it has to be hidden explicitly once a page has rendered;
+  // hiding only its children would leave a white sheet covering the page.
+  private lateinit var statusPanel: LinearLayout
   private lateinit var statusView: TextView
   private lateinit var actionButton: Button
   private var pageRequested = false
@@ -123,14 +127,6 @@ class SnappyMailActivity : Activity() {
     webView =
         WebView(this).apply {
           setBackgroundColor(Color.WHITE)
-          // MIUI's GPU/compositor path hangs for this WebView: the DOM, CSS and JS are all fine
-          // (getComputedStyle and innerText return the rendered login page) but nothing reaches
-          // the screen, and even Page.captureScreenshot never completes. Forcing a software
-          // layer bypasses the HWUI render thread entirely, so the page is drawn on the main
-          // thread and composition cannot stall. The manifest also sets
-          // android:hardwareAccelerated="false" on this activity; both are needed because the
-          // window flag alone does not keep the WebView renderer off the GPU path.
-          setLayerType(View.LAYER_TYPE_SOFTWARE, null)
           visibility = View.INVISIBLE
           settings.javaScriptEnabled = true
           settings.domStorageEnabled = true
@@ -180,11 +176,14 @@ class SnappyMailActivity : Activity() {
                     // onPageFinished still fires for the error page; keep the status text up.
                     return
                   }
-                  // A real page landed: reveal it and reset the retry budget.
+                  // A real page landed: reveal it and reset the retry budget. statusPanel is the
+                  // white full-screen container stacked on top of the WebView, so it must be
+                  // hidden too; hiding only its children leaves a white sheet over the page.
                   retryCount = 0
                   pageRequested = true
                   statusView.visibility = View.GONE
                   actionButton.visibility = View.GONE
+                  statusPanel.visibility = View.GONE
                   webView.visibility = View.VISIBLE
                 }
 
@@ -233,7 +232,7 @@ class SnappyMailActivity : Activity() {
         }
     root.addView(webView, FrameLayout.LayoutParams(MATCH_PARENT, MATCH_PARENT))
 
-    val statusPanel =
+    statusPanel =
         LinearLayout(this).apply {
           orientation = LinearLayout.VERTICAL
           gravity = Gravity.CENTER
@@ -314,6 +313,8 @@ class SnappyMailActivity : Activity() {
     if (!pageRequested) {
       webView.visibility = View.INVISIBLE
     }
+    // The container is hidden once a page renders, so bring it back before touching its children.
+    statusPanel.visibility = View.VISIBLE
     statusView.text = message
     statusView.visibility = View.VISIBLE
     if (actionLabel != null && action != null) {
