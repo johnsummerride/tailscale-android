@@ -33,6 +33,7 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
@@ -189,19 +190,32 @@ class SnappyMailActivity : Activity() {
   }
 
   private fun observeVpnState() {
+    // Re-evaluate whenever either the IPN state or the tunnel status changes. vpnActive flips to
+    // true only after net.updateTUN gets an fd from VpnService.Builder.establish, which is the
+    // first moment the tailnet address space is actually routable.
     scope.launch {
-      Notifier.state.collect { state -> updateForState(state) }
+      combine(Notifier.state, App.get().getAppScopedViewModel().vpnActive) { state, _ -> state }
+          .collect { state -> updateForState(state) }
     }
   }
 
   private fun updateForState(state: Ipn.State) {
     TSLog.d(TAG, "tailscale state: $state")
+    val vpnActive = App.get().getAppScopedViewModel().vpnActive.value
     when (state) {
       Ipn.State.Running -> {
-        // Running means the tunnel is configured, not that it can carry packets yet: DERP/direct
-        // path negotiation can take tens of seconds more. Loading the URL here would leave the
-        // WebView stuck in a connect that only fails after Chromium's own long timeout, so wait
-        // for a TCP probe to reach the webmail first.
+        // Running means the backend reached the coordination server, not that packets can flow:
+        // without an established TUN device every connect to the tailnet times out. Make sure
+        // IPNService is running and wait for vpnActive before probing.
+        if (!vpnActive) {
+          TSLog.d(TAG, "backend Running but VPN tunnel not established yet")
+          showStatus(getString(R.string.snappymail_starting_vpn), null, null)
+          startVpnIfNeeded()
+          return
+        }
+        // Even with the TUN device up, DERP/direct path negotiation can take a moment. Loading
+        // the URL immediately would leave the WebView in a connect that only fails after
+        // Chromium's own long timeout, so wait for a TCP probe to reach the webmail first.
         if (pageRequested || probeJob?.isActive == true) {
           return
         }
@@ -294,6 +308,13 @@ class SnappyMailActivity : Activity() {
               getString(R.string.snappymail_unreachable, "$WEBMAIL_HOST:$WEBMAIL_PORT"),
               getString(R.string.snappymail_retry),
           ) { startReachabilityProbe() }
+          if (!App.get().getAppScopedViewModel().vpnActive.value) {
+            // The probes never had a TUN device behind them, so re-probing cannot help. Re-arm
+            // IPNService instead; the vpnActive collector restarts the probe once it is up.
+            TSLog.d(TAG, "VPN tunnel is still down after probing, restarting IPNService")
+            vpnStartRequested = false
+            startVpnIfNeeded(restart = Notifier.state.value == Ipn.State.Running)
+          }
         }
   }
 
@@ -346,8 +367,8 @@ class SnappyMailActivity : Activity() {
     startReachabilityProbe()
   }
 
-  private fun startVpnIfNeeded() {
-    if (vpnStartRequested) {
+  private fun startVpnIfNeeded(restart: Boolean = false) {
+    if (vpnStartRequested && !restart) {
       return
     }
     vpnStartRequested = true
@@ -357,7 +378,13 @@ class SnappyMailActivity : Activity() {
       startActivityForResult(prepareIntent, VPN_PERMISSION_REQUEST_CODE)
     } else {
       App.get().getAppScopedViewModel().setVpnPrepared(true)
-      App.get().startVPN()
+      if (restart) {
+        // IPNService is already running but never got an fd; ACTION_RESTART_VPN tears it down and
+        // starts a fresh one, which re-runs net.updateTUN.
+        App.get().restartVPN()
+      } else {
+        App.get().startVPN()
+      }
     }
   }
 

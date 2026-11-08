@@ -16,6 +16,7 @@ import android.content.res.Configuration.SCREENLAYOUT_SIZE_MASK
 import android.net.ConnectivityManager
 import android.net.NetworkCapabilities
 import android.net.Uri
+import android.net.VpnService
 import android.os.Build
 import android.os.Bundle
 import android.os.Process
@@ -131,8 +132,10 @@ import com.tailscale.ipn.util.ShareFileHelper
 import com.tailscale.ipn.util.TSLog
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.launch
 
 class MainActivity : ComponentActivity() {
@@ -143,12 +146,20 @@ class MainActivity : ComponentActivity() {
   private var deepLinkNavigator: DeepLinkNavigator? = null
   private var pendingDeepLink: Uri? = null
   private var snappyMailLaunched = false
+  // Tracks whether we already asked for the VPN consent dialog or started IPNService, so the
+  // state collector does not spam startVPN() on every emission.
+  private var vpnStartRequested = false
 
   val permissionsViewModel: PermissionsViewModel by viewModels()
 
   companion object {
     private const val TAG = "Main Activity"
     private const val START_AT_ROOT = "startAtRoot"
+    // How many times to nudge IPNService when the backend is Running but no TUN device exists yet,
+    // and how long to wait between nudges. Six 5s windows cover a slow DERP handshake without
+    // keeping the user on a blank screen forever.
+    private const val VPN_TUNNEL_RETRIES = 6
+    private const val VPN_TUNNEL_RETRY_DELAY_MS = 5000L
   }
 
   private inline fun <reified T : Any> backTo(): () -> Unit = {
@@ -522,17 +533,78 @@ class MainActivity : ComponentActivity() {
     // NullPointerException from Context.getPackageName(). See onTailnetRunning().
   }
 
-  // onTailnetRunning hands over to the SnappyMail web UI as soon as the tailnet is up. Pressing
-  // back from there returns to this screen, and the VPN keeps running in the background.
+  // onTailnetRunning hands over to the SnappyMail web UI only once the VPN tunnel is actually
+  // carrying traffic. Ipn.State.Running means the Go backend reached the coordination server; it
+  // does not mean IPNService established a TUN device. The tunnel is up when net.updateTUN calls
+  // VpnService.Builder.establish() and reports UpdateVpnStatus(true), which surfaces as
+  // AppViewModel.vpnActive. Jumping to the webmail on Running alone left the user on a white
+  // screen while connects to 100.83.40.43:8090 timed out with no route into the tailnet.
   private fun onTailnetRunning() {
     lifecycleScope.launch {
-      Notifier.state.collect { state ->
-        if (state == Ipn.State.Running && !snappyMailLaunched && !isFinishing && !isDestroyed) {
-          snappyMailLaunched = true
-          TSLog.d(TAG, "tailnet is up, opening SnappyMail")
-          startActivity(Intent(this@MainActivity, SnappyMailActivity::class.java))
+      combine(Notifier.state, appViewModel.vpnActive) { state, vpnActive -> state to vpnActive }
+          .collect { (state, vpnActive) ->
+            if (isFinishing || isDestroyed) {
+              return@collect
+            }
+            if (state == Ipn.State.Running && !vpnActive) {
+              // Backend is up but the VpnService was never started (or failed to establish).
+              // Request consent if needed, otherwise start IPNService.
+              ensureVpnTunnelStarted()
+              return@collect
+            }
+            if (!vpnActive || snappyMailLaunched) {
+              return@collect
+            }
+            snappyMailLaunched = true
+            TSLog.d(TAG, "VPN tunnel established, opening SnappyMail")
+            startActivity(Intent(this@MainActivity, SnappyMailActivity::class.java))
+          }
+    }
+
+    // Backstop: if Running never turns into an established tunnel (consent dismissed, establish()
+    // failed, another VPN holds the slot), nudge IPNService a few times rather than leaving the
+    // user staring at a blank screen.
+    lifecycleScope.launch {
+      repeat(VPN_TUNNEL_RETRIES) { attempt ->
+        delay(VPN_TUNNEL_RETRY_DELAY_MS)
+        if (snappyMailLaunched || isFinishing || isDestroyed) {
+          return@launch
         }
+        if (Notifier.state.value != Ipn.State.Running || appViewModel.vpnActive.value) {
+          return@launch
+        }
+        TSLog.d(TAG, "VPN tunnel still down, restarting IPNService (attempt ${attempt + 1})")
+        vpnStartRequested = false
+        ensureVpnTunnelStarted(restart = attempt > 0, allowConsent = false)
       }
+    }
+  }
+
+  // ensureVpnTunnelStarted mirrors the user-initiated connect path: ask for consent when
+  // VpnService.prepare() returns an Intent, otherwise start IPNService directly. The permission
+  // launcher registered in onCreate() calls startVPN() as soon as the user grants access.
+  private fun ensureVpnTunnelStarted(restart: Boolean = false, allowConsent: Boolean = true) {
+    if (vpnStartRequested && !restart) {
+      return
+    }
+    vpnStartRequested = true
+    val prepareIntent = VpnService.prepare(this)
+    TSLog.d(TAG, "ensureVpnTunnelStarted: prepare non-null intent=${prepareIntent != null}")
+    if (prepareIntent != null) {
+      if (!allowConsent) {
+        // The system consent dialog was already offered once; re-showing it on every retry would
+        // just nag the user. Leave the tunnel down until they act.
+        TSLog.d(TAG, "VPN consent still not granted, not re-prompting")
+        return
+      }
+      viewModel.showVPNPermissionLauncherIfUnauthorized()
+      return
+    }
+    appViewModel.setVpnPrepared(true)
+    if (restart) {
+      App.get().restartVPN()
+    } else {
+      App.get().startVPN()
     }
   }
 
