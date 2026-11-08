@@ -9,6 +9,11 @@
     <string name="snappymail_sign_in">Sign in</string>
     <string name="snappymail_vpn_denied">Tailscale VPN permission was denied.</string>
     <string name="snappymail_retry">Retry</string>
+    <!-- Load failures are surfaced to the user, who may not read English. -->
+    <string name="snappymail_load_failed">加载失败: %1$s</string>
+    <string name="snappymail_load_failed_giving_up">加载失败: %1$s（已自动重试 %2$d 次）</string>
+    <string name="snappymail_retrying">%1$d 秒后自动重试（%2$d/%3$d）</string>
+    <string name="snappymail_http_error">HTTP %1$d</string>
 
     <!-- Generic Strings -->
     <string name="log_in">Log in</string>
