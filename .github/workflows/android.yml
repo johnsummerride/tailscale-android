@@ -1,6 +1,8 @@
 name: Android CI
 
 on:
+  # Local fork: allow starting a build by hand from the Actions tab or gh.
+  workflow_dispatch:
   push:
     branches:
       - main
