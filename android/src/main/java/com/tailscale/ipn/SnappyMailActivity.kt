@@ -13,6 +13,9 @@ import android.view.Gravity
 import android.view.View
 import android.view.ViewGroup.LayoutParams.MATCH_PARENT
 import android.view.ViewGroup.LayoutParams.WRAP_CONTENT
+import android.webkit.ConsoleMessage
+import android.webkit.CookieManager
+import android.webkit.WebChromeClient
 import android.webkit.WebResourceError
 import android.webkit.WebResourceRequest
 import android.webkit.WebResourceResponse
@@ -57,6 +60,33 @@ class SnappyMailActivity : Activity() {
     private const val PROBE_TIMEOUT_MS = 3000
     private const val PROBE_INTERVAL_MS = 2000L
     private const val MAX_PROBES = 30
+    // DIAGNOSTICS_JS mirrors the branches in SnappyMail's bootstrap: it reports the cookie and
+    // Array.prototype.flat feature tests the app performs plus the visibility of the layers it
+    // uses to report failures (all of which are styled in near-white text).
+    private const val DIAGNOSTICS_JS =
+        """(function () {
+          function layer(id) {
+            var el = document.getElementById(id);
+            if (!el) return 'absent';
+            var cs = window.getComputedStyle(el);
+            return (el.hidden || cs.display === 'none' || cs.visibility === 'hidden')
+              ? 'hidden' : 'VISIBLE';
+          }
+          var body = document.body;
+          return JSON.stringify({
+            href: location.href,
+            readyState: document.readyState,
+            cookieEnabled: navigator.cookieEnabled,
+            cookie: document.cookie,
+            arrayFlat: typeof [].flat,
+            title: document.title,
+            noCookie: layer('rl-NoCookie'),
+            loading: layer('rl-loading'),
+            loadingError: layer('rl-loading-error'),
+            scripts: document.scripts.length,
+            bodyText: body ? (body.innerText || '').trim().slice(0, 160) : '(no body)'
+          });
+        })()"""
   }
 
   private lateinit var webView: WebView
@@ -81,6 +111,13 @@ class SnappyMailActivity : Activity() {
     // publishes the IPN state, is running.
     App.get()
 
+    // SnappyMail is a single page JS app that keeps its session in a cookie (smctoken). Its
+    // bootstrap checks navigator.cookieEnabled first and, when that is false, shows the "no
+    // cookie" layer instead of the login form. A WebView has cookies disabled until the app
+    // turns the CookieManager on, which is why the system browser worked and this one did not.
+    WebView.setWebContentsDebuggingEnabled(true)
+    CookieManager.getInstance().setAcceptCookie(true)
+
     val root = FrameLayout(this)
 
     webView =
@@ -94,6 +131,25 @@ class SnappyMailActivity : Activity() {
           settings.loadWithOverviewMode = true
           settings.builtInZoomControls = true
           settings.displayZoomControls = false
+          // The login POST is same-site, but enabling third-party cookies as well removes any
+          // doubt about the session cookie sticking after the app's own redirects.
+          CookieManager.getInstance().setAcceptThirdPartyCookies(this, true)
+          // Forward the page's own console output (including uncaught JS errors) to logcat so a
+          // blank page can be explained from `adb logcat -s SnappyMail:V` alone.
+          webChromeClient =
+              object : WebChromeClient() {
+                override fun onConsoleMessage(message: ConsoleMessage?): Boolean {
+                  if (message == null) {
+                    return true
+                  }
+                  TSLog.d(
+                      TAG,
+                      "console[${message.messageLevel()}] ${message.message()} " +
+                          "(${message.sourceId()}:${message.lineNumber()})",
+                  )
+                  return true
+                }
+              }
           // Keep navigation inside the WebView; links in the webmail stay here. The client also
           // reports load failures instead of leaving the user on a silent white screen.
           webViewClient =
@@ -107,6 +163,11 @@ class SnappyMailActivity : Activity() {
                 override fun onPageFinished(view: WebView?, url: String?) {
                   super.onPageFinished(view, url)
                   TSLog.d(TAG, "page finished: $url")
+                  // SnappyMail renders its whole UI from JS, so a loaded page can still be an
+                  // empty white screen. Sample the DOM state right away and again after the app
+                  // has had a moment to boot, and log what the page itself sees.
+                  logDiagnostics("page-finished")
+                  view?.postDelayed({ logDiagnostics("page-finished+2.5s") }, 2500L)
                   if (mainFrameFailed) {
                     // onPageFinished still fires for the error page; keep the status text up.
                     return
@@ -143,6 +204,12 @@ class SnappyMailActivity : Activity() {
                 ) {
                   super.onReceivedHttpError(view, request, errorResponse)
                   if (request != null && !request.isForMainFrame) {
+                    // A failing subresource (a JS bundle, an API call) is invisible on screen but
+                    // is the usual reason a JS-only page stays blank.
+                    TSLog.d(
+                        TAG,
+                        "subresource http error ${errorResponse?.statusCode ?: -1}: ${request.url}",
+                    )
                     return
                   }
                   mainFrameFailed = true
@@ -257,6 +324,24 @@ class SnappyMailActivity : Activity() {
     pageRequested = true
     TSLog.d(TAG, "loading $WEBMAIL_URL")
     webView.loadUrl(WEBMAIL_URL)
+  }
+
+  // logDiagnostics reports what the page itself believes about its environment. SnappyMail draws
+  // every placeholder (loading, no-cookie, bad browser, load error) in near-white text on white, so
+  // a failed bootstrap is indistinguishable from a blank page on screen; these log lines are what
+  // separates them from `adb logcat -s SnappyMail:V`.
+  private fun logDiagnostics(stage: String) {
+    if (destroyed || !this::webView.isInitialized) {
+      return
+    }
+    val cookie = CookieManager.getInstance().getCookie(WEBMAIL_URL)
+    val cookieText = if (cookie.isNullOrEmpty()) "<none>" else cookie
+    TSLog.d(TAG, "[$stage] cookieManager.getCookie($WEBMAIL_URL)=$cookieText")
+    try {
+      webView.evaluateJavascript(DIAGNOSTICS_JS) { result -> TSLog.d(TAG, "[$stage] js: $result") }
+    } catch (e: Exception) {
+      TSLog.d(TAG, "[$stage] evaluateJavascript failed: ${e.javaClass.simpleName} ${e.message}")
+    }
   }
 
   // isWebmailReachable does a TCP connect to the webmail port from a background thread. A refused
