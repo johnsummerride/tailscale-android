@@ -1,6 +1,15 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
 
+
+    <!-- SnappyMail webmail viewer -->
+    <string name="snappymail_connecting">Connecting to Tailscale...</string>
+    <string name="snappymail_starting_vpn">Starting Tailscale VPN...</string>
+    <string name="snappymail_needs_login">Tailscale needs you to sign in before the webmail can be reached.</string>
+    <string name="snappymail_sign_in">Sign in</string>
+    <string name="snappymail_vpn_denied">Tailscale VPN permission was denied.</string>
+    <string name="snappymail_retry">Retry</string>
+
     <!-- Generic Strings -->
     <string name="log_in">Log in</string>
     <string name="log_out">Log out</string>

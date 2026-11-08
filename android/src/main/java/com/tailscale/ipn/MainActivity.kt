@@ -142,6 +142,7 @@ class MainActivity : ComponentActivity() {
   private lateinit var viewModel: MainViewModel
   private var deepLinkNavigator: DeepLinkNavigator? = null
   private var pendingDeepLink: Uri? = null
+  private var snappyMailLaunched = false
 
   val permissionsViewModel: PermissionsViewModel by viewModels()
 
@@ -510,6 +511,17 @@ class MainActivity : ComponentActivity() {
     }
     // Once we see a loginFinished event, clear the QR code which will dismiss the QR dialog.
     lifecycleScope.launch { Notifier.loginFinished.collect { _ -> loginQRCode.set(null) } }
+    // As soon as the tailnet is up, hand over to the SnappyMail web UI. Pressing back from
+    // there returns to this screen, and the VPN keeps running in the background.
+    lifecycleScope.launch {
+      Notifier.state.collect { state ->
+        if (state == Ipn.State.Running && !snappyMailLaunched) {
+          snappyMailLaunched = true
+          TSLog.d(TAG, "tailnet is up, opening SnappyMail")
+          startActivity(Intent(this@MainActivity, SnappyMailActivity::class.java))
+        }
+      }
+    }
   }
 
   private fun showOtherVPNConflictDialog() {
