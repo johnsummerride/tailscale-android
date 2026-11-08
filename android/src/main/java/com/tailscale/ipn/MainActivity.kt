@@ -494,6 +494,12 @@ class MainActivity : ComponentActivity() {
         }
       }
     }
+
+    // Context is attached by now, so it is safe to build an Intent and start the webmail activity.
+    // Skipped on recreation so a rotation does not bounce the user back into the webmail.
+    if (savedInstanceState == null) {
+      onTailnetRunning()
+    }
   }
 
   init {
@@ -511,11 +517,17 @@ class MainActivity : ComponentActivity() {
     }
     // Once we see a loginFinished event, clear the QR code which will dismiss the QR dialog.
     lifecycleScope.launch { Notifier.loginFinished.collect { _ -> loginQRCode.set(null) } }
-    // As soon as the tailnet is up, hand over to the SnappyMail web UI. Pressing back from
-    // there returns to this screen, and the VPN keeps running in the background.
+    // The SnappyMail hand-off lives in onCreate, not here: this block runs during construction,
+    // before the Activity's base context is attached, and building the Intent there throws
+    // NullPointerException from Context.getPackageName(). See onTailnetRunning().
+  }
+
+  // onTailnetRunning hands over to the SnappyMail web UI as soon as the tailnet is up. Pressing
+  // back from there returns to this screen, and the VPN keeps running in the background.
+  private fun onTailnetRunning() {
     lifecycleScope.launch {
       Notifier.state.collect { state ->
-        if (state == Ipn.State.Running && !snappyMailLaunched) {
+        if (state == Ipn.State.Running && !snappyMailLaunched && !isFinishing && !isDestroyed) {
           snappyMailLaunched = true
           TSLog.d(TAG, "tailnet is up, opening SnappyMail")
           startActivity(Intent(this@MainActivity, SnappyMailActivity::class.java))

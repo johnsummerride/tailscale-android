@@ -25,11 +25,16 @@ import android.widget.TextView
 import com.tailscale.ipn.ui.model.Ipn
 import com.tailscale.ipn.ui.notifier.Notifier
 import com.tailscale.ipn.util.TSLog
+import java.net.InetSocketAddress
+import java.net.Socket
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 // SnappyMailActivity shows the self-hosted SnappyMail webmail that lives on the tailnet.
 //
@@ -41,9 +46,16 @@ class SnappyMailActivity : Activity() {
   private companion object {
     private const val TAG = "SnappyMail"
     private const val VPN_PERMISSION_REQUEST_CODE = 7001
+    private const val WEBMAIL_HOST = "100.83.40.43"
+    private const val WEBMAIL_PORT = 8090
     private const val WEBMAIL_URL = "http://100.83.40.43:8090"
     private const val MAX_RETRIES = 5
     private const val RETRY_DELAY_MS = 3000L
+    // The socket probe that gates the first loadUrl. connect() gives up after PROBE_TIMEOUT_MS, and
+    // the loop retries every PROBE_INTERVAL_MS up to MAX_PROBES times (~60s) before giving up.
+    private const val PROBE_TIMEOUT_MS = 3000
+    private const val PROBE_INTERVAL_MS = 2000L
+    private const val MAX_PROBES = 30
   }
 
   private lateinit var webView: WebView
@@ -56,6 +68,9 @@ class SnappyMailActivity : Activity() {
   // error page WebView renders in place of the webmail.
   private var mainFrameFailed = false
   private var destroyed = false
+  // The reachability poll started from Ipn.State.Running; cancelled on destroy and on a manual
+  // retry so two loops never race to call loadUrl.
+  private var probeJob: Job? = null
   private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
 
   override fun onCreate(savedInstanceState: Bundle?) {
@@ -183,10 +198,14 @@ class SnappyMailActivity : Activity() {
     TSLog.d(TAG, "tailscale state: $state")
     when (state) {
       Ipn.State.Running -> {
-        statusView.visibility = View.GONE
-        actionButton.visibility = View.GONE
-        webView.visibility = View.VISIBLE
-        loadWebmailIfNeeded()
+        // Running means the tunnel is configured, not that it can carry packets yet: DERP/direct
+        // path negotiation can take tens of seconds more. Loading the URL here would leave the
+        // WebView stuck in a connect that only fails after Chromium's own long timeout, so wait
+        // for a TCP probe to reach the webmail first.
+        if (pageRequested || probeJob?.isActive == true) {
+          return
+        }
+        startReachabilityProbe()
       }
       Ipn.State.Starting,
       Ipn.State.Stopping -> showStatus(getString(R.string.snappymail_connecting), null, null)
@@ -224,6 +243,58 @@ class SnappyMailActivity : Activity() {
     pageRequested = true
     TSLog.d(TAG, "loading $WEBMAIL_URL")
     webView.loadUrl(WEBMAIL_URL)
+  }
+
+  // isWebmailReachable does a TCP connect to the webmail port from a background thread. A refused
+  // or timed-out connect means the tailnet data path is not carrying traffic yet. The socket is
+  // closed in finally so repeated probes do not leak descriptors.
+  private suspend fun isWebmailReachable(): Boolean =
+      withContext(Dispatchers.IO) {
+        val socket = Socket()
+        try {
+          socket.connect(InetSocketAddress(WEBMAIL_HOST, WEBMAIL_PORT), PROBE_TIMEOUT_MS)
+          true
+        } catch (e: Exception) {
+          TSLog.d(TAG, "probe $WEBMAIL_HOST:$WEBMAIL_PORT failed: ${e.javaClass.simpleName}")
+          false
+        } finally {
+          try {
+            socket.close()
+          } catch (e: Exception) {
+            // The socket is being discarded; a failed close is not actionable.
+          }
+        }
+      }
+
+  // startReachabilityProbe polls the webmail port until it answers, then hands off to the WebView.
+  // It runs on the activity scope, so onDestroy cancels it along with everything else.
+  private fun startReachabilityProbe() {
+    if (destroyed) {
+      return
+    }
+    probeJob?.cancel()
+    probeJob =
+        scope.launch {
+          mainFrameFailed = false
+          retryCount = 0
+          pageRequested = false
+          for (attempt in 1..MAX_PROBES) {
+            showStatus(getString(R.string.snappymail_probing_network), null, null)
+            if (isWebmailReachable()) {
+              TSLog.d(TAG, "webmail reachable after $attempt probe(s)")
+              loadWebmailIfNeeded()
+              return@launch
+            }
+            if (attempt < MAX_PROBES) {
+              delay(PROBE_INTERVAL_MS)
+            }
+          }
+          TSLog.d(TAG, "webmail unreachable after $MAX_PROBES probes")
+          showStatus(
+              getString(R.string.snappymail_unreachable, "$WEBMAIL_HOST:$WEBMAIL_PORT"),
+              getString(R.string.snappymail_retry),
+          ) { startReachabilityProbe() }
+        }
   }
 
   // scheduleRetry is called for a failed main-frame load. It clears pageRequested so the status
@@ -265,11 +336,14 @@ class SnappyMailActivity : Activity() {
     )
   }
 
+  // retryFromScratch re-runs the reachability probe rather than loading immediately: after a
+  // WebView failure the tunnel may have dropped again, and probing keeps us from stalling inside
+  // another connect that would only fail after Chromium's own timeout.
   private fun retryFromScratch() {
     retryCount = 0
     mainFrameFailed = false
     pageRequested = false
-    loadWebmailIfNeeded()
+    startReachabilityProbe()
   }
 
   private fun startVpnIfNeeded() {
@@ -316,6 +390,8 @@ class SnappyMailActivity : Activity() {
 
   override fun onDestroy() {
     destroyed = true
+    probeJob?.cancel()
+    probeJob = null
     scope.cancel()
     webView.destroy()
     super.onDestroy()

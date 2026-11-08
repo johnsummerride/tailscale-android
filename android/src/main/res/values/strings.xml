@@ -14,6 +14,9 @@
     <string name="snappymail_load_failed_giving_up">加载失败: %1$s（已自动重试 %2$d 次）</string>
     <string name="snappymail_retrying">%1$d 秒后自动重试（%2$d/%3$d）</string>
     <string name="snappymail_http_error">HTTP %1$d</string>
+    <!-- Shown while the TCP probe waits for the tailnet data path to come up. -->
+    <string name="snappymail_probing_network">正在连接内部网络…</string>
+    <string name="snappymail_unreachable">无法连接 %1$s</string>
 
     <!-- Generic Strings -->
     <string name="log_in">Log in</string>
